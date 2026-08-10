@@ -1,193 +1,315 @@
-import re
 import json
-import requests
 import logging
+import re
 import urllib.parse
+from email import policy
+from email.parser import BytesParser
 
-class Requester(object):
-    protocol   = "http"
-    host       = ""
-    method     = ""
-    action     = ""
-    headers    = {}
-    data       = {}
+import requests
 
+FUZZ_MARKER = "*FUZZ*"
+BODY_METHODS = {"POST", "PUT"}
+
+
+class Requester:
     def __init__(self, path, uagent, ssl, proxies):
+        self.headers = {}
+        self.data = {}
+        self.body = b""
+        self.protocol = "http"
+        self.host = ""
+        self.method = ""
+        self.action = ""
+        self.proxies = proxies
+        self.media_type = ""
+        self.multipart_boundary = None
+
         try:
-            # Read file request
-            with open(path, 'r') as f:
-                content = f.read().strip()
-        except IOError as e:
+            with open(path, "rb") as request_file:
+                content = request_file.read()
+        except OSError:
             logging.error("File not found")
-            exit()
+            raise SystemExit from None
 
         try:
-            content = content.split('\n')
-            # Parse method and action URI
-            regex = re.compile('(.*) (.*) HTTP')
-            self.method, self.action = regex.findall(content[0])[0]
+            header_block, self.body = self._split_message(content)
+            self._parse_request_head(header_block)
 
-            # Parse headers
-            for header in content[1:]:
-                if header == '':
-                    # edge-case, when data is sent raw (json/xml)
-                    break
-                name, _, value = header.partition(': ')
-                if not name or not value:
-                    continue
-                self.headers[name] = value
-            self.host = self.headers['Host']
+            if uagent is not None:
+                self._set_header("User-Agent", uagent)
 
-            # Parse user-agent        
-            if uagent != None:
-                self.headers['User-Agent'] = uagent
-            
-            # Parse data
-            self.data_to_dict(content[-1])
+            self.data_to_dict(self.body)
 
-            # Handling HTTPS requests
-            if ssl == True:
-                self.protocol   = "https"
-            
-            self.proxies = proxies
+            if ssl is True:
+                self.protocol = "https"
+        except (KeyError, ValueError, UnicodeError, json.JSONDecodeError) as error:
+            logging.warning("Bad request format: %s", error)
 
-        except Exception as e:
-            logging.warning("Bad Format or Raw data !")
+    @staticmethod
+    def _split_message(content):
+        for separator in (b"\r\n\r\n", b"\n\n"):
+            if separator in content:
+                return content.split(separator, 1)
+        return content, b""
 
+    def _parse_request_head(self, header_block):
+        lines = re.split(rb"\r?\n", header_block)
+        if not lines or not lines[0]:
+            raise ValueError("missing request line")
+
+        request_line = lines[0].decode("latin-1")
+        match = re.fullmatch(r"([^\s]+)\s+([^\s]+)\s+HTTP/\d+(?:\.\d+)?", request_line)
+        if match is None:
+            raise ValueError("invalid request line")
+        self.method, self.action = match.groups()
+        self.method = self.method.upper()
+
+        current_header = None
+        for raw_line in lines[1:]:
+            line = raw_line.decode("latin-1")
+            if line[:1].isspace() and current_header is not None:
+                self.headers[current_header] += " " + line.strip()
+                continue
+
+            name, separator, value = line.partition(":")
+            if not separator or not name.strip():
+                raise ValueError(f"invalid header line: {line!r}")
+            current_header = name.strip()
+            self.headers[current_header] = value.strip()
+
+        self.host = self._get_header("Host")
+
+    def _get_header(self, name, default=None):
+        lowered_name = name.lower()
+        for header_name, value in self.headers.items():
+            if header_name.lower() == lowered_name:
+                return value
+        if default is not None:
+            return default
+        raise KeyError(name)
+
+    def _set_header(self, name, value):
+        lowered_name = name.lower()
+        for header_name in self.headers:
+            if header_name.lower() == lowered_name:
+                self.headers[header_name] = value
+                return
+        self.headers[name] = value
+
+    @staticmethod
+    def _without_header(headers, name):
+        lowered_name = name.lower()
+        return {
+            header_name: value
+            for header_name, value in headers.items()
+            if header_name.lower() != lowered_name
+        }
+
+    def _parse_content_type(self):
+        content_type = self._get_header("Content-Type", "")
+        if not content_type:
+            return "", None
+
+        message = BytesParser(policy=policy.default).parsebytes(
+            f"Content-Type: {content_type}\r\n\r\n".encode("latin-1")
+        )
+        return message.get_content_type().lower(), message.get_boundary()
+
+    @staticmethod
+    def _multipart_part(segment):
+        leading_length = 2 if segment.startswith(b"\r\n") else int(segment.startswith(b"\n"))
+        part = segment[leading_length:]
+
+        separator = b"\r\n\r\n"
+        header_end = part.find(separator)
+        if header_end < 0:
+            separator = b"\n\n"
+            header_end = part.find(separator)
+        if header_end < 0:
+            return None
+
+        header_block = part[:header_end]
+        message = BytesParser(policy=policy.default).parsebytes(header_block + b"\r\n\r\n")
+        name = message.get_param("name", header="content-disposition")
+        if name is None:
+            return None
+
+        value_start = leading_length + header_end + len(separator)
+        value_end = len(segment)
+        if segment.endswith(b"\r\n"):
+            value_end -= 2
+        elif segment.endswith(b"\n"):
+            value_end -= 1
+
+        charset = message.get_content_charset() or "utf-8"
+        return name, value_start, value_end, charset
+
+    def _parse_multipart(self, body):
+        if not self.multipart_boundary:
+            raise ValueError("multipart/form-data request has no boundary")
+
+        delimiter = b"--" + self.multipart_boundary.encode("latin-1")
+        if delimiter not in body:
+            raise ValueError("multipart boundary is missing from the request body")
+
+        fields = {}
+        for segment in body.split(delimiter)[1:]:
+            part = self._multipart_part(segment)
+            if part is None:
+                continue
+            name, value_start, value_end, charset = part
+            fields[name] = segment[value_start:value_end].decode(charset, errors="replace")
+        return fields
+
+    def _replace_multipart_field(self, name, value):
+        delimiter = b"--" + self.multipart_boundary.encode("latin-1")
+        segments = self.body.split(delimiter)
+        replaced = False
+
+        for index, segment in enumerate(segments[1:], start=1):
+            part = self._multipart_part(segment)
+            if part is None:
+                continue
+            part_name, value_start, value_end, charset = part
+            if part_name == name:
+                original = segment[value_start:value_end]
+                marker = FUZZ_MARKER.encode(charset)
+                payload = str(value).encode(charset)
+                replacement = original.replace(marker, payload) if marker in original else payload
+                segments[index] = segment[:value_start] + replacement + segment[value_end:]
+                replaced = True
+
+        if not replaced:
+            raise ValueError(f"multipart field not found: {name}")
+        return delimiter.join(segments)
 
     def data_to_dict(self, data):
-        if self.method == "POST":
+        if self.method not in BODY_METHODS:
+            return
 
-            # Handle JSON data
-            if self.headers['Content-Type'] and "application/json" in self.headers['Content-Type']:
-                self.data = json.loads(data)
+        body = data if isinstance(data, bytes) else data.encode()
+        self.media_type, self.multipart_boundary = self._parse_content_type()
+        decoded_body = body.decode("utf-8", errors="replace")
 
-            # Handle XML data
-            elif self.headers['Content-Type'] and "application/xml" in self.headers['Content-Type']:
-                self.data['__xml__'] = data
+        if self.media_type == "application/json" or self.media_type.endswith("+json"):
+            self.data = json.loads(decoded_body)
+        elif self.media_type in {"application/xml", "text/xml"} or self.media_type.endswith("+xml"):
+            self.data["__xml__"] = decoded_body
+        elif self.media_type == "multipart/form-data":
+            self.data = self._parse_multipart(body)
+        elif self.media_type in {"", "application/x-www-form-urlencoded"}:
+            self.data = dict(
+                urllib.parse.parse_qsl(decoded_body.rstrip("\r\n"), keep_blank_values=True)
+            )
+        else:
+            self.data["__raw__"] = decoded_body
 
-            # Handle FORM data
-            else:
-                for arg in data.split("&"):
-                    regex = re.compile('(.*)=(.*)')
-                    for name,value in regex.findall(arg):
-                        name = urllib.parse.unquote(name)
-                        value = urllib.parse.unquote(value)
-                        self.data[name] = value
+    @staticmethod
+    def _inject_value(original, payload):
+        if isinstance(original, str) and FUZZ_MARKER in original:
+            return original.replace(FUZZ_MARKER, str(payload))
+        return payload
 
+    def _body_data(self, param, value):
+        if self.media_type == "multipart/form-data":
+            return self._replace_multipart_field(param, value)
+
+        if self.media_type in {"application/xml", "text/xml"} or self.media_type.endswith("+xml"):
+            xml = self.data["__xml__"]
+            if param not in xml or FUZZ_MARKER not in xml:
+                raise ValueError("No XML injection point found! Use *FUZZ* in the target field.")
+            return xml.replace(FUZZ_MARKER, value)
+
+        if param == "" and "__raw__" in self.data:
+            return self._inject_value(self.data["__raw__"], value)
+
+        if param not in self.data:
+            raise ValueError(f"No injection point found for parameter: {param}")
+
+        injected = self.data.copy()
+        injected[param] = self._inject_value(injected[param], value)
+        if self.media_type == "application/json" or self.media_type.endswith("+json"):
+            return json.dumps(injected)
+        return injected
 
     def do_request(self, param, value, timeout=3, stream=False):
         try:
-            # Debug information
-            logging.debug(f"Request param: {param}")
-            logging.debug(f"Request value: {value}")
-            logging.debug(f"Request timeout: {timeout}")
+            logging.debug("Request param: %s", param)
+            logging.debug("Request value: %s", value)
+            logging.debug("Request timeout: %s", timeout)
 
-            # Handle injection in the headers
-            # Copying data to avoid multiple variables edit
             header_injected = self.headers.copy()
-            if param in header_injected:
-                header_injected[param] = value
-                logging.debug("Request inject: Injecting payload in HTTP Header")
+            header_name = next(
+                (name for name in header_injected if name.lower() == param.lower()),
+                None,
+            )
+            if header_name is not None:
+                header_injected[header_name] = self._inject_value(
+                    header_injected[header_name], value
+                )
+                logging.debug("Injecting payload in HTTP header")
 
-            logging.debug(f"Request method: {self.method}")
-            if self.method == "POST":
-
-                # Copying data to avoid multiple variables edit
-                data_injected = self.data.copy()
-
-                if param in str(data_injected): # Fix for issue/10 : str(data_injected)
-                    data_injected[param] = value
-            
-                    # Handle JSON data
-                    if self.headers['Content-Type'] and "application/json" in self.headers['Content-Type']:
-                        logging.debug("Request type: JSON")
-                        logging.debug(f"Request data: {data_injected}")
-
-                        r = requests.post(
-                            self.protocol + "://" + self.host + self.action, 
-                            data=json.dumps(data_injected),
-                            headers=self.headers,
-                            timeout=timeout,
-                            stream=stream,
-                            verify=False,
-                            proxies=self.proxies
-                        )
-
-                    # Handle XML data
-                    elif self.headers['Content-Type'] and "application/xml" in self.headers['Content-Type']:
-                        logging.debug("Request type: XML")
-
-                        if "*FUZZ*" in data_injected['__xml__']:
-                            logging.debug("Request inject: XML parameter")
-
-                            # replace the injection point with the payload
-                            data_xml = data_injected['__xml__']
-                            data_xml = data_xml.replace('*FUZZ*', value)
-
-                            logging.debug(f"Request data: {data_xml}")
-                            r = requests.post(
-                                self.protocol + "://" + self.host + self.action,
-                                data=data_xml,
-                                headers=self.headers,
-                                timeout=timeout,
-                                stream=stream,
-                                verify=False,
-                                proxies=self.proxies
-                            )                            
-                            
-                        else:
-                            logging.error("No injection point found ! (use -p)")
-                            exit(1)  
-
-                    # Handle FORM data
-                    else:
-                        if param == '': 
-                            logging.debug("Request inject: POST raw data")
-                            data_injected = value
-                        else:
-                            logging.debug("Request inject: POST parameter")
-
-                        r = requests.post(
-                            self.protocol + "://" + self.host + self.action, 
-                            headers=header_injected, 
-                            data=data_injected,
-                            timeout=timeout,
-                            stream=stream,
-                            verify=False,
-                            proxies=self.proxies
-                        )
-
+            logging.debug("Request method: %s", self.method)
+            if self.method in BODY_METHODS:
+                if header_name is not None and param not in self.data:
+                    data_injected = self.body
                 else:
-                    logging.error("No injection point found ! (use -p)")
-                    exit(1)  
-            else:
-                logging.debug("Request inject: GET parameter")
-                
-                # String is immutable, we don't have to do a "forced" copy
-                regex = re.compile(param+"=([^&]+)")
-                value = urllib.parse.quote(value, safe='')
-                data_injected = re.sub(regex, param+'='+value, self.action)
-                r = requests.get(
-                    self.protocol + "://" + self.host + data_injected, 
-                    headers=header_injected,
+                    data_injected = self._body_data(param, value)
+
+                # Captured Content-Length values become invalid when a payload changes.
+                # Let requests calculate the correct length for the outgoing body.
+                outgoing_headers = self._without_header(header_injected, "Content-Length")
+                request_function = requests.post if self.method == "POST" else requests.put
+                return request_function(
+                    self.protocol + "://" + self.host + self.action,
+                    headers=outgoing_headers,
+                    data=data_injected,
                     timeout=timeout,
                     stream=stream,
                     verify=False,
-                    proxies=self.proxies
+                    proxies=self.proxies,
                 )
-        except Exception as e:
-            logging.error(e)
+
+            if self.method != "GET":
+                raise ValueError(f"Unsupported HTTP method: {self.method}")
+
+            logging.debug("Injecting payload in GET parameter")
+            encoded_value = urllib.parse.quote(value, safe="")
+            pattern = re.compile(r"([?&])" + re.escape(param) + r"=([^&]*)")
+
+            def replace_query_value(match):
+                original = match.group(2)
+                encoded_marker = urllib.parse.quote(FUZZ_MARKER, safe="")
+                if FUZZ_MARKER in original:
+                    injected = original.replace(FUZZ_MARKER, encoded_value)
+                elif encoded_marker.lower() in original.lower():
+                    injected = re.sub(
+                        re.escape(encoded_marker),
+                        encoded_value,
+                        original,
+                        flags=re.IGNORECASE,
+                    )
+                else:
+                    injected = encoded_value
+                return f"{match.group(1)}{param}={injected}"
+
+            data_injected = pattern.sub(
+                replace_query_value,
+                self.action,
+            )
+            return requests.get(
+                self.protocol + "://" + self.host + data_injected,
+                headers=header_injected,
+                timeout=timeout,
+                stream=stream,
+                verify=False,
+                proxies=self.proxies,
+            )
+        except Exception as error:
+            logging.error(error)
             return None
-        return r
 
     def __str__(self):
-        text =  self.method + " "
-        text += self.action + " HTTP/1.1\n"
-        for header in self.headers:
-            text += header + ": " + self.headers[header] + "\n"
-
-        text += "\n\n"
-        for data in self.data:
-            text += data + "=" + self.data[data] + "&"
-        return text[:-1]
+        headers = "\n".join(f"{name}: {value}" for name, value in self.headers.items())
+        body = self.body.decode("latin-1")
+        return f"{self.method} {self.action} HTTP/1.1\n{headers}\n\n{body}"
